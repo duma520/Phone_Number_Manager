@@ -1,25 +1,88 @@
 import sys
 import sqlite3
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+import csv
+import json
+import os
+import time
+from datetime import datetime
+import tempfile
+import webbrowser
+
+# PySide6 导入
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QTableWidget, QTableWidgetItem, QMessageBox,
-                            QComboBox, QTabWidget, QHeaderView, QSystemTrayIcon)
-from PyQt5.QtCore import Qt, QDateTime
-from PyQt5.QtGui import QIcon,QColor
+                            QComboBox, QTabWidget, QHeaderView, QSystemTrayIcon,
+                            QFileDialog, QDialog, QFormLayout, QGroupBox,
+                            QScrollArea, QSizePolicy, QCheckBox)
+from PySide6.QtCore import Qt, QDateTime, QTimer, QByteArray
+from PySide6.QtGui import QIcon, QColor, QPixmap, QAction
+from PySide6.QtCharts import (QChart, QChartView, QPieSeries, QBarSeries, 
+                          QBarSet, QBarCategoryAxis, QLineSeries, QValueAxis)
+
+# 电话号码解析库
 import phonenumbers
 from phonenumbers import carrier, geocoder, timezone
 import phone
 from phone import Phone
 from phone_iso3166.country import phone_country
+import folium
+import folium.plugins
+import requests
+
+# 新增配置加载函数
+def load_config():
+    """加载配置文件"""
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARNING] 无法加载配置文件: {e}")
+        return {}
+
+# 加载配置
+config = load_config()
+
+
+# 设置持久化（实时自动保存，★ v3.0.0）
+def settings_path():
+    """返回设置文件路径（程序目录 / 打包后 exe 目录）"""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, 'phone_number_manager_settings.json')
+
+
+def load_settings():
+    """加载设置文件"""
+    try:
+        with open(settings_path(), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARNING] 加载设置失败: {e}")
+        return {}
+
+
+def save_settings(settings):
+    """原子写入设置文件（tmp + os.replace）"""
+    try:
+        path = settings_path()
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"[WARNING] 保存设置失败: {e}")
+        return False
+
 
 # 数据库初始化
 def init_db():
     conn = sqlite3.connect('phone_numbers.db')
     cursor = conn.cursor()
-
-    # 创建表后，添加检查代码
-    cursor.execute('SELECT operator FROM mobile_operators WHERE prefix = "189"')
-    cursor.execute('SELECT operator FROM mobile_operators WHERE prefix = "135"')
 
     # 创建固话区号表
     cursor.execute('''
@@ -54,7 +117,8 @@ def init_db():
         area_code TEXT,
         area_location TEXT,
         user_number TEXT NOT NULL,
-        registration_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        registration_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_blacklisted BOOLEAN DEFAULT 0
     )
     ''')
     
@@ -68,7 +132,29 @@ def init_db():
         area_code TEXT,
         area_location TEXT,
         user_number TEXT NOT NULL,
-        registration_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        registration_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_blacklisted BOOLEAN DEFAULT 0
+    )
+    ''')
+    
+    # 创建黑名单表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS blacklist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number TEXT NOT NULL UNIQUE,
+        number_type TEXT NOT NULL,
+        reason TEXT,
+        added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # 创建备份记录表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS backup_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backup_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        backup_file TEXT NOT NULL,
+        note TEXT
     )
     ''')
     
@@ -979,7 +1065,7 @@ def init_db():
         ('106', '短消息服务号（需完整8位）')
     ])
 
-    
+    # 手机运营商数据
     cursor.executemany('INSERT OR IGNORE INTO mobile_operators (prefix, operator, province) VALUES (?, ?, ?)', [
         ('134', '中国移动', '全国'),
         ('135', '中国移动', '全国'),
@@ -1076,7 +1162,7 @@ def init_db():
         ('192', '中国广电', '全国')
     ])
 
-    
+    # 手机地区编码数据
     cursor.executemany('INSERT OR IGNORE INTO mobile_area_codes (code, location) VALUES (?, ?)', [
         # 直辖市
         ('1000', '北京'),
@@ -1517,10 +1603,41 @@ def init_db():
     conn.commit()
     conn.close()
 
+def update_db_schema():
+    conn = sqlite3.connect('phone_numbers.db')
+    cursor = conn.cursor()
+    
+    # 为固话表添加黑名单列
+    try:
+        cursor.execute('ALTER TABLE landline_numbers ADD COLUMN is_blacklisted BOOLEAN DEFAULT 0')
+    except sqlite3.OperationalError as e:
+        print(f"[DEBUG] 可能列已存在: {e}")
+    
+    # 为手机表添加黑名单列
+    try:
+        cursor.execute('ALTER TABLE mobile_numbers ADD COLUMN is_blacklisted BOOLEAN DEFAULT 0')
+    except sqlite3.OperationalError as e:
+        print(f"[DEBUG] 可能列已存在: {e}")
+    
+    # 确保黑名单表存在
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS blacklist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number TEXT NOT NULL UNIQUE,
+        number_type TEXT NOT NULL,
+        reason TEXT,
+        added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "1.21.0"
-    BUILD_DATE = "2025-05-19"
+    VERSION = "3.0.0"
+    BUILD_DATE = "2026-08-20"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
     COPYRIGHT = "© 永久 杜玛"
@@ -1528,26 +1645,129 @@ class ProjectInfo:
     MAINTAINER_EMAIL = "不提供"
     NAME = "电话号码管理系统"
     DESCRIPTION = "电话号码管理系统，支持固话和手机号码的管理、查询和分析。"
-
+    REQUIREMENTS = ["PySide6>=6.4", "phonenumbers>=8.12", "folium>=0.12"]
+    DOCUMENTATION_URL = "https://github.com/duma520/phone-manager/wiki"
+    ISSUE_TRACKER_URL = "https://github.com/duma520/phone-manager/issues"
+    RELEASE_NOTES = {
+        "3.0.0": "引入设置实时自动保存机制（窗口几何/最大化/API Key 持久化），建立维护约定（软件升级迭代记录.md/version 备份/_scaffold）",
+        "2.7.0": "迁移到 PySide6 版本",
+        "2.2.0": "新增归属地地图功能，优化号码解析算法",
+        "2.1.0": "增加黑名单管理功能，改进用户界面",
+        "2.0.0": "重构核心架构，支持多数据库"
+    }
 
     @classmethod
     def get_metadata(cls) -> dict:
-        """获取主要元数据字典"""
+        """获取完整元数据字典"""
         return {
+            'name': cls.NAME,
             'version': cls.VERSION,
+            'build_date': cls.BUILD_DATE,
             'author': cls.AUTHOR,
             'license': cls.LICENSE,
-            'url': cls.URL
+            'copyright': cls.COPYRIGHT,
+            'url': cls.URL,
+            'maintainer_email': cls.MAINTAINER_EMAIL,
+            'description': cls.DESCRIPTION,
+            'requirements': cls.REQUIREMENTS,
+            'documentation': cls.DOCUMENTATION_URL,
+            'issue_tracker': cls.ISSUE_TRACKER_URL
         }
-
 
     @classmethod
     def get_header(cls) -> str:
         """生成标准化的项目头信息"""
         return f"{cls.NAME} {cls.VERSION} | {cls.LICENSE} License | {cls.URL}"
+
+    @classmethod
+    def get_about_dialog_content(cls) -> str:
+        """生成关于对话框的HTML内容"""
+        return f"""
+        <html>
+        <body>
+            <h1>{cls.NAME}</h1>
+            <p><b>版本:</b> {cls.VERSION} ({cls.BUILD_DATE})</p>
+            <p><b>作者:</b> {cls.AUTHOR}</p>
+            <p><b>许可证:</b> {cls.LICENSE}</p>
+            <p><b>版权所有:</b> {cls.COPYRIGHT}</p>
+            <hr>
+            <p>{cls.DESCRIPTION}</p>
+            <p><b>项目主页:</b> <a href="{cls.URL}">{cls.URL}</a></p>
+            <p><b>文档:</b> <a href="{cls.DOCUMENTATION_URL}">查看文档</a></p>
+            <p><b>问题反馈:</b> <a href="{cls.ISSUE_TRACKER_URL}">提交问题</a></p>
+            <hr>
+            <h3>系统要求:</h3>
+            <ul>
+                {"".join(f"<li>{req}</li>" for req in cls.REQUIREMENTS)}
+            </ul>
+        </body>
+        </html>
+        """
+
+    @classmethod
+    def get_version_history(cls) -> str:
+        """获取版本历史信息"""
+        return "\n".join(
+            f"版本 {version}: {notes}"
+            for version, notes in sorted(
+                cls.RELEASE_NOTES.items(),
+                key=lambda x: tuple(map(int, x[0].split('.'))),
+                reverse=True
+            )
+        )
+
+    @classmethod
+    def check_for_updates(cls) -> dict:
+        """
+        检查更新（模拟实现）
+        实际应用中应该从服务器获取最新版本信息
+        """
+        return {
+            "current_version": cls.VERSION,
+            "latest_version": "3.0.0",
+            "update_available": False,
+            "release_notes": cls.get_version_history(),
+            "download_url": f"{cls.URL}/releases"
+        }
+
+    @classmethod
+    def get_license_text(cls) -> str:
+        """获取许可证文本"""
+        return f"""
+        {cls.NAME} - {cls.DESCRIPTION}
+        版本 {cls.VERSION} | 构建日期 {cls.BUILD_DATE}
+        
+        版权所有 (c) {cls.COPYRIGHT}
+        作者: {cls.AUTHOR}
+        联系方式: {cls.MAINTAINER_EMAIL}
+        
+        根据 {cls.LICENSE} 许可证发布:
+        - 允许自由使用、修改和分发
+        - 需保留版权声明和许可证文件
+        - 不提供任何担保
+        
+        完整许可证文本请参考: 
+        https://opensource.org/licenses/MIT
+        """
+
+    @classmethod
+    def get_system_info(cls) -> dict:
+        """获取系统环境信息"""
+        import platform
+        import sys
+        from PySide6.QtCore import __version__ as pyside6_version
+        from PySide6.QtCore import qVersion
+        
+        return {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "python_version": sys.version,
+            "pyside6_version": pyside6_version,
+            "qt_version": qVersion(),
+            "executable": sys.executable
+        }
+
     
-
-
 # 马卡龙色系定义
 class MacaronColors:
     # 粉色系
@@ -1574,16 +1794,561 @@ class MacaronColors:
     # 中性色
     CARAMEL_CREAM = QColor(240, 230, 221) # 焦糖奶霜
 
+
+# 批量导入对话框
+class ImportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量导入号码")
+        self.setWindowIcon(QIcon('icon.ico'))
+        self.resize(500, 400)
+        
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # 文件选择区域
+        file_group = QGroupBox("选择文件")
+        file_layout = QVBoxLayout()
+        
+        self.file_path = QLineEdit()
+        self.file_path.setPlaceholderText("点击浏览选择文件...")
+        file_layout.addWidget(self.file_path)
+        
+        browse_btn = QPushButton("浏览...")
+        browse_btn.clicked.connect(self.browse_file)
+        file_layout.addWidget(browse_btn)
+        
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+        
+        # 导入选项区域
+        options_group = QGroupBox("导入选项")
+        options_layout = QFormLayout()
+        
+        self.file_type = QComboBox()
+        self.file_type.addItems(["CSV", "TXT"])
+        options_layout.addRow("文件类型:", self.file_type)
+        
+        self.number_type = QComboBox()
+        self.number_type.addItems(["自动检测", "固话号码", "手机号码"])
+        options_layout.addRow("号码类型:", self.number_type)
+        
+        self.skip_duplicates = QCheckBox("跳过已存在的号码")
+        self.skip_duplicates.setChecked(True)
+        options_layout.addRow(self.skip_duplicates)
+        
+        options_group.setLayout(options_layout)
+        layout.addWidget(options_group)
+        
+        # 按钮区域
+        btn_layout = QHBoxLayout()
+        self.import_btn = QPushButton("开始导入")
+        self.import_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.import_btn)
+        
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(btn_layout)
+    
+    def browse_file(self):
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getOpenFileName(
+            self, "选择文件", "", 
+            "所有文件 (*.*);;CSV文件 (*.csv);;文本文件 (*.txt)"
+        )
+        if file_path:
+            self.file_path.setText(file_path)
+            # 根据文件扩展名自动设置文件类型
+            if file_path.lower().endswith('.csv'):
+                self.file_type.setCurrentText('CSV')
+            elif file_path.lower().endswith('.txt'):
+                self.file_type.setCurrentText('TXT')
+
+
+# 统计图表对话框
+class StatsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("号码统计图表")
+        self.setWindowIcon(QIcon('icon.ico'))
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # 图表类型选择
+        chart_type_layout = QHBoxLayout()
+        chart_type_layout.addWidget(QLabel("图表类型:"))
+        
+        self.chart_type = QComboBox()
+        self.chart_type.addItems(["运营商分布", "归属地分布", "号码类型分布"])
+        self.chart_type.currentIndexChanged.connect(self.update_chart)
+        chart_type_layout.addWidget(self.chart_type)
+        
+        layout.addLayout(chart_type_layout)
+        
+        # 图表视图
+        self.chart_view = QChartView()
+        self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.chart_view)
+        
+        # 初始加载数据
+        self.update_chart()
+    
+    def update_chart(self):
+        chart_type = self.chart_type.currentText()
+        chart = QChart()
+        chart.setTitle(f"号码统计 - {chart_type}")
+        chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+        
+        if chart_type == "运营商分布":
+            series = QPieSeries()
+            
+            # 从数据库获取运营商分布数据
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT operator_name, COUNT(*) as count 
+                FROM mobile_numbers 
+                GROUP BY operator_name
+                ORDER BY count DESC
+                LIMIT 10
+            ''')
+            results = cursor.fetchall()
+            conn.close()
+            
+            for operator, count in results:
+                series.append(f"{operator} ({count})", count)
+            
+            series.setLabelsVisible(True)
+            chart.addSeries(series)
+            
+        elif chart_type == "归属地分布":
+            series = QBarSeries()
+            
+            # 从数据库获取归属地分布数据
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT area_location, COUNT(*) as count 
+                FROM (
+                    SELECT area_location FROM mobile_numbers
+                    UNION ALL
+                    SELECT area_location FROM landline_numbers
+                )
+                WHERE area_location != '无' AND area_location != '未知地区'
+                GROUP BY area_location
+                ORDER BY count DESC
+                LIMIT 10
+            ''')
+            results = cursor.fetchall()
+            conn.close()
+            
+            categories = []
+            bar_set = QBarSet("号码数量")
+            
+            for location, count in results:
+                categories.append(location)
+                bar_set.append(count)
+            
+            series.append(bar_set)
+            chart.addSeries(series)
+            
+            axis_x = QBarCategoryAxis()
+            axis_x.append(categories)
+            chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+            series.attachAxis(axis_x)
+            
+            axis_y = QValueAxis()
+            axis_y.setLabelFormat("%d")
+            chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+            series.attachAxis(axis_y)
+            
+        elif chart_type == "号码类型分布":
+            series = QPieSeries()
+            
+            # 从数据库获取号码类型分布数据
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            
+            # 手机号码数量
+            cursor.execute('SELECT COUNT(*) FROM mobile_numbers')
+            mobile_count = cursor.fetchone()[0]
+            
+            # 固话号码数量
+            cursor.execute('SELECT COUNT(*) FROM landline_numbers')
+            landline_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            series.append(f"手机号码 ({mobile_count})", mobile_count)
+            series.append(f"固话号码 ({landline_count})", landline_count)
+            
+            series.setLabelsVisible(True)
+            chart.addSeries(series)
+        
+        self.chart_view.setChart(chart)
+
+
+# 黑名单管理对话框
+class BlacklistDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("黑名单管理")
+        self.setWindowIcon(QIcon('icon.ico'))
+        self.resize(600, 400)
+        
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # 输入区域
+        input_layout = QHBoxLayout()
+        
+        self.number_input = QLineEdit()
+        self.number_input.setPlaceholderText("输入要加入黑名单的号码")
+        input_layout.addWidget(self.number_input)
+        
+        self.add_btn = QPushButton("添加")
+        self.add_btn.clicked.connect(self.add_to_blacklist)
+        input_layout.addWidget(self.add_btn)
+        
+        layout.addLayout(input_layout)
+        
+        # 黑名单表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "号码", "类型", "添加时间"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table)
+        
+        # 操作按钮
+        btn_layout = QHBoxLayout()
+        
+        self.remove_btn = QPushButton("移除选中")
+        self.remove_btn.clicked.connect(self.remove_from_blacklist)
+        btn_layout.addWidget(self.remove_btn)
+        
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.load_blacklist)
+        btn_layout.addWidget(refresh_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # 初始加载数据
+        self.load_blacklist()
+    
+    def load_blacklist(self):
+        conn = sqlite3.connect('phone_numbers.db')
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT id, number, number_type, added_time 
+                FROM blacklist 
+                ORDER BY added_time DESC
+            ''')
+            data = cursor.fetchall()
+            
+            self.table.setRowCount(len(data))
+            for row_idx, row_data in enumerate(data):
+                for col_idx, col_data in enumerate(row_data):
+                    item = QTableWidgetItem(str(col_data))
+                    item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+                    self.table.setItem(row_idx, col_idx, item)
+                    
+        except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
+            QMessageBox.warning(self, "错误", f"数据库错误: {str(e)}")
+        finally:
+            conn.close()
+    
+    def add_to_blacklist(self):
+        number = self.number_input.text().strip()
+        if not number:
+            QMessageBox.warning(self, "警告", "请输入号码!")
+            return
+        
+        # 确定号码类型
+        if len(number) == 11 and number.startswith('1'):
+            number_type = "手机"
+        else:
+            number_type = "固话"
+        
+        # 添加到黑名单表
+        conn = sqlite3.connect('phone_numbers.db')
+        cursor = conn.cursor()
+        
+        try:
+            # 检查是否已在黑名单
+            cursor.execute('SELECT id FROM blacklist WHERE number = ?', (number,))
+            if cursor.fetchone():
+                QMessageBox.information(self, "提示", "该号码已在黑名单中!")
+                return
+            
+            # 添加到黑名单表
+            cursor.execute('''
+                INSERT INTO blacklist (number, number_type)
+                VALUES (?, ?)
+            ''', (number, number_type))
+            
+            # 更新号码表中的黑名单标记
+            if number_type == "手机":
+                cursor.execute('''
+                    UPDATE mobile_numbers 
+                    SET is_blacklisted = 1 
+                    WHERE full_number = ?
+                ''', (number,))
+            else:
+                cursor.execute('''
+                    UPDATE landline_numbers 
+                    SET is_blacklisted = 1 
+                    WHERE full_number = ?
+                ''', (number,))
+            
+            conn.commit()
+            QMessageBox.information(self, "成功", "号码已添加到黑名单!")
+            self.number_input.clear()
+            self.load_blacklist()
+            
+        except sqlite3.Error as e:
+            conn.rollback()
+            print(f"[DEBUG] 数据库错误: {str(e)}")
+            QMessageBox.warning(self, "错误", f"数据库错误: {str(e)}")
+        finally:
+            conn.close()
+    
+    def remove_from_blacklist(self):
+        selected_items = self.table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请选择要移除的记录!")
+            return
+        
+        row = selected_items[0].row()
+        number_id = self.table.item(row, 0).text()
+        number = self.table.item(row, 1).text()
+        number_type = self.table.item(row, 2).text()
+        
+        # 确认移除
+        reply = QMessageBox.question(
+            self, '确认', 
+            f'确定要从黑名单中移除号码 {number} 吗?', 
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.No:
+            return
+        
+        # 从黑名单中移除
+        conn = sqlite3.connect('phone_numbers.db')
+        cursor = conn.cursor()
+        
+        try:
+            # 从黑名单表删除
+            cursor.execute('DELETE FROM blacklist WHERE id = ?', (number_id,))
+            
+            # 更新号码表中的黑名单标记
+            if number_type == "手机":
+                cursor.execute('''
+                    UPDATE mobile_numbers 
+                    SET is_blacklisted = 0 
+                    WHERE full_number = ?
+                ''', (number,))
+            else:
+                cursor.execute('''
+                    UPDATE landline_numbers 
+                    SET is_blacklisted = 0 
+                    WHERE full_number = ?
+                ''', (number,))
+            
+            conn.commit()
+            QMessageBox.information(self, "成功", "号码已从黑名单中移除!")
+            self.load_blacklist()
+            
+        except sqlite3.Error as e:
+            conn.rollback()
+            print(f"[DEBUG] 数据库错误: {str(e)}")
+            QMessageBox.warning(self, "错误", f"数据库错误: {str(e)}")
+        finally:
+            conn.close()
+
+
+# 数据库备份对话框
+class BackupDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("数据库备份与恢复")
+        self.setWindowIcon(QIcon('icon.ico'))
+        self.resize(500, 300)
+        
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # 备份区域
+        backup_group = QGroupBox("备份数据库")
+        backup_layout = QVBoxLayout()
+        
+        self.backup_path = QLineEdit()
+        self.backup_path.setPlaceholderText("点击浏览选择备份位置...")
+        backup_layout.addWidget(self.backup_path)
+        
+        browse_backup_btn = QPushButton("浏览...")
+        browse_backup_btn.clicked.connect(self.browse_backup_path)
+        backup_layout.addWidget(browse_backup_btn)
+        
+        self.backup_note = QLineEdit()
+        self.backup_note.setPlaceholderText("备份备注(可选)")
+        backup_layout.addWidget(self.backup_note)
+        
+        backup_btn = QPushButton("执行备份")
+        backup_btn.clicked.connect(self.perform_backup)
+        backup_layout.addWidget(backup_btn)
+        
+        backup_group.setLayout(backup_layout)
+        layout.addWidget(backup_group)
+        
+        # 恢复区域
+        restore_group = QGroupBox("恢复数据库")
+        restore_layout = QVBoxLayout()
+        
+        self.restore_path = QLineEdit()
+        self.restore_path.setPlaceholderText("点击浏览选择备份文件...")
+        restore_layout.addWidget(self.restore_path)
+        
+        browse_restore_btn = QPushButton("浏览...")
+        browse_restore_btn.clicked.connect(self.browse_restore_file)
+        restore_layout.addWidget(browse_restore_btn)
+        
+        restore_btn = QPushButton("执行恢复")
+        restore_btn.clicked.connect(self.perform_restore)
+        restore_layout.addWidget(restore_btn)
+        
+        restore_group.setLayout(restore_layout)
+        layout.addWidget(restore_group)
+    
+    def browse_backup_path(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "选择备份目录")
+        if dir_path:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = f"phone_numbers_backup_{timestamp}.db"
+            self.backup_path.setText(os.path.join(dir_path, backup_file))
+    
+    def browse_restore_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择备份文件", "", 
+            "数据库文件 (*.db);;所有文件 (*.*)"
+        )
+        if file_path:
+            self.restore_path.setText(file_path)
+    
+    def perform_backup(self):
+        backup_path = self.backup_path.text().strip()
+        if not backup_path:
+            QMessageBox.warning(self, "警告", "请选择备份位置!")
+            return
+        
+        try:
+            # 执行备份
+            conn = sqlite3.connect('phone_numbers.db')
+            backup_conn = sqlite3.connect(backup_path)
+            
+            with backup_conn:
+                conn.backup(backup_conn)
+            
+            # 记录备份历史
+            note = self.backup_note.text().strip()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO backup_history (backup_file, note)
+                VALUES (?, ?)
+            ''', (backup_path, note if note else None))
+            conn.commit()
+            
+            QMessageBox.information(self, "成功", "数据库备份成功!")
+            self.backup_path.clear()
+            self.backup_note.clear()
+            
+        except sqlite3.Error as e:
+            QMessageBox.warning(self, "错误", f"备份失败: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
+            if 'backup_conn' in locals():
+                backup_conn.close()
+    
+    def perform_restore(self):
+        restore_path = self.restore_path.text().strip()
+        if not restore_path:
+            QMessageBox.warning(self, "警告", "请选择备份文件!")
+            return
+        
+        # 确认恢复
+        reply = QMessageBox.question(
+            self, '确认', 
+            '恢复操作将覆盖当前数据库，是否继续?', 
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.No:
+            return
+        
+        try:
+            # 关闭当前数据库连接
+            if hasattr(self.parent(), 'close_db_connections'):
+                self.parent().close_db_connections()
+            
+            # 执行恢复
+            backup_conn = sqlite3.connect(restore_path)
+            conn = sqlite3.connect('phone_numbers.db')
+            
+            with conn:
+                backup_conn.backup(conn)
+            
+            QMessageBox.information(self, "成功", "数据库恢复成功!")
+            self.restore_path.clear()
+            
+            # 通知主窗口刷新数据
+            if hasattr(self.parent(), 'refresh_all_data'):
+                QTimer.singleShot(100, self.parent().refresh_all_data)
+            
+        except sqlite3.Error as e:
+            QMessageBox.warning(self, "错误", f"恢复失败: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
+            if 'backup_conn' in locals():
+                backup_conn.close()
+
+
 # 主窗口类
 class PhoneNumberManager(QMainWindow):
     def __init__(self):
         super().__init__()
+        # 设置实时自动保存（★ v3.0.0）
+        self._settings = load_settings()
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(500)  # 500ms 防抖
+        self._settings_save_timer.timeout.connect(self._save_settings_now)
+        
+        # 兼容迁移：旧 config.json 的 gaode_api_key 合并进 settings.json（仅首次）
+        if 'gaode_api_key' not in self._settings and config.get('gaode_api_key'):
+            self._settings['gaode_api_key'] = config.get('gaode_api_key')
+            self._save_settings_now()
+        self.config = {'gaode_api_key': self._settings.get('gaode_api_key', '')}
+        
         self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION}")
         self.setWindowIcon(QIcon('icon.ico'))
-        self.resize(800, 600)
+        self._start_maximized = bool(self._settings.get('window_maximized', False))
+        self._restore_window_geometry()
         
         # 初始化数据库
         init_db()
+        update_db_schema()
         
         # 创建主控件
         self.main_widget = QWidget()
@@ -1592,6 +2357,9 @@ class PhoneNumberManager(QMainWindow):
         # 主布局
         self.main_layout = QVBoxLayout()
         self.main_widget.setLayout(self.main_layout)
+        
+        # 创建菜单栏
+        self.create_menu_bar()
         
         # 创建标签页
         self.tabs = QTabWidget()
@@ -1620,6 +2388,93 @@ class PhoneNumberManager(QMainWindow):
         self.mobile_table.horizontalHeader().sectionClicked.connect(self.sort_mobile_table)
         self.query_table.horizontalHeader().sectionClicked.connect(self.sort_query_table)
     
+    # ---------- 设置实时自动保存（★ v3.0.0） ----------
+    def _autosave_settings(self):
+        """防抖触发自动保存（500ms 单次定时器）"""
+        self._settings_save_timer.start()
+    
+    def _save_settings_now(self):
+        """立即收集并原子写入设置文件（tmp + os.replace）"""
+        if self.isVisible():
+            self._settings['window_geometry'] = bytes(self.saveGeometry().toBase64()).decode('utf-8')
+            self._settings['window_maximized'] = self.isMaximized()
+        save_settings(self._settings)
+    
+    def _restore_window_geometry(self):
+        """启动时恢复窗口几何与最大化状态"""
+        geom = self._settings.get('window_geometry')
+        if geom:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(geom.encode('utf-8')))
+            except Exception as e:
+                print(f"[WARNING] 恢复窗口几何失败: {e}")
+                self.resize(1000, 700)
+        else:
+            self.resize(1000, 700)
+    
+    def moveEvent(self, event):
+        """窗口移动 → 防抖自动保存"""
+        super().moveEvent(event)
+        self._autosave_settings()
+    
+    def resizeEvent(self, event):
+        """窗口缩放 → 防抖自动保存"""
+        super().resizeEvent(event)
+        self._autosave_settings()
+    
+    def closeEvent(self, event):
+        """退出前强制保存设置"""
+        self._settings_save_timer.stop()
+        self._save_settings_now()
+        event.accept()
+    
+    def create_menu_bar(self):
+        """创建菜单栏"""
+        menubar = self.menuBar()
+        
+        # 文件菜单
+        file_menu = menubar.addMenu("文件")
+        
+        import_action = QAction("批量导入...", self)
+        import_action.triggered.connect(self.show_import_dialog)
+        file_menu.addAction(import_action)
+        
+        export_action = QAction("导出数据...", self)
+        export_action.triggered.connect(self.export_data)
+        file_menu.addAction(export_action)
+        
+        backup_action = QAction("备份/恢复...", self)
+        backup_action.triggered.connect(self.show_backup_dialog)
+        file_menu.addAction(backup_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("退出", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # 工具菜单
+        tools_menu = menubar.addMenu("工具")
+        
+        stats_action = QAction("统计图表...", self)
+        stats_action.triggered.connect(self.show_stats_dialog)
+        tools_menu.addAction(stats_action)
+        
+        blacklist_action = QAction("黑名单管理...", self)
+        blacklist_action.triggered.connect(self.show_blacklist_dialog)
+        tools_menu.addAction(blacklist_action)
+        
+        map_action = QAction("归属地地图...", self)
+        map_action.triggered.connect(self.show_location_map)
+        tools_menu.addAction(map_action)
+        
+        # 帮助菜单
+        help_menu = menubar.addMenu("帮助")
+        
+        about_action = QAction("关于", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+    
     def create_landline_tab(self):
         """创建固话号码管理标签页"""
         self.landline_tab = QWidget()
@@ -1634,19 +2489,19 @@ class PhoneNumberManager(QMainWindow):
         
         self.landline_input = QLineEdit()
         self.landline_input.setPlaceholderText("请输入固话号码（可带区号，如037165026940或87654321）或手机号码（11位）")
-        self.landline_input.returnPressed.connect(self.add_phone_number)  # 修改连接的方法
+        self.landline_input.returnPressed.connect(self.add_phone_number)
         input_layout.addWidget(self.landline_input)
         
         self.add_landline_btn = QPushButton("添加")
-        self.add_landline_btn.clicked.connect(self.add_phone_number)  # 修改连接的方法
+        self.add_landline_btn.clicked.connect(self.add_phone_number)
         input_layout.addWidget(self.add_landline_btn)
         
         # 表格区域
         self.landline_table = QTableWidget()
-        self.landline_table.setColumnCount(6)
-        self.landline_table.setHorizontalHeaderLabels(["ID", "完整号码", "区号", "归属地", "用户号码", "登记时间"])
-        self.landline_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.landline_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.landline_table.setColumnCount(7)
+        self.landline_table.setHorizontalHeaderLabels(["ID", "完整号码", "区号", "归属地", "用户号码", "登记时间", "黑名单"])
+        self.landline_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.landline_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.landline_table)
         
         # 操作按钮区域
@@ -1661,7 +2516,6 @@ class PhoneNumberManager(QMainWindow):
         self.refresh_landline_btn.clicked.connect(self.load_landline_data)
         btn_layout.addWidget(self.refresh_landline_btn)
     
-    # 合并输入，删除这个多余的
     def create_mobile_tab(self):
         """创建手机号码管理标签页"""
         self.mobile_tab = QWidget()
@@ -1670,26 +2524,13 @@ class PhoneNumberManager(QMainWindow):
         layout = QVBoxLayout()
         self.mobile_tab.setLayout(layout)
         
-        # 输入区域
-        #input_layout = QHBoxLayout()
-        #layout.addLayout(input_layout)
-        
-        #self.mobile_input = QLineEdit()
-        #self.mobile_input.setPlaceholderText("请输入手机号码（如13012345678）")
-        #self.mobile_input.returnPressed.connect(self.add_mobile_number)
-        #input_layout.addWidget(self.mobile_input)
-        
-        #self.add_mobile_btn = QPushButton("添加")
-        #self.add_mobile_btn.clicked.connect(self.add_mobile_number)
-        #input_layout.addWidget(self.add_mobile_btn)
-        
         # 表格区域
         self.mobile_table = QTableWidget()
-        self.mobile_table.setColumnCount(8)
-        self.mobile_table.setHorizontalHeaderLabels(["ID", "完整号码", "运营商前缀", "运营商", "地区编码", "归属地", "用户号码", "登记时间"])
-        self.mobile_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.mobile_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.mobile_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.mobile_table.setColumnCount(9)
+        self.mobile_table.setHorizontalHeaderLabels(["ID", "完整号码", "运营商前缀", "运营商", "地区编码", "归属地", "用户号码", "登记时间", "黑名单"])
+        self.mobile_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.mobile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.mobile_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         layout.addWidget(self.mobile_table)
         
         # 操作按钮区域
@@ -1736,10 +2577,10 @@ class PhoneNumberManager(QMainWindow):
 
         # 查询结果表格
         self.query_table = QTableWidget()
-        self.query_table.setColumnCount(9)
-        self.query_table.setHorizontalHeaderLabels(["类型", "ID", "完整号码", "区号/运营商", "归属地/运营商", "地区编码", "归属地", "用户号码", "登记时间"])
-        self.query_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.query_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.query_table.setColumnCount(10)
+        self.query_table.setHorizontalHeaderLabels(["类型", "ID", "完整号码", "区号/运营商", "归属地/运营商", "地区编码", "归属地", "用户号码", "登记时间", "黑名单"])
+        self.query_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.query_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.query_table)
     
     def add_landline_number(self):
@@ -1803,13 +2644,14 @@ class PhoneNumberManager(QMainWindow):
             self.landline_input.clear()
             self.load_landline_data()
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         finally:
             conn.close()
     
     def add_mobile_number(self):
         """添加手机号码"""
-        number = self.mobile_input.text().strip()
+        number = self.landline_input.text().strip()
         if not number:
             self.show_notification("警告", "请输入手机号码！", False)
             return
@@ -1830,6 +2672,7 @@ class PhoneNumberManager(QMainWindow):
                 cursor.execute('SELECT id FROM mobile_numbers WHERE full_number = ?', (number,))
                 if cursor.fetchone():
                     self.show_notification("提示", "该手机号码已存在，无需重复添加！", False)
+                    self.landline_input.clear()  # 新增：清空输入框
                     return
                     
                 # 保存到数据库
@@ -1842,11 +2685,12 @@ class PhoneNumberManager(QMainWindow):
                 ''', (number, operator_prefix, operator_name, area_code, area_location, user_number))
                 conn.commit()
                 self.show_notification("成功", "手机号码添加成功！(使用本地数据库)")
-                self.mobile_input.clear()
+                self.landline_input.clear()
                 self.load_mobile_data()
                 return
                 
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
             conn.close()
             return
@@ -1887,6 +2731,7 @@ class PhoneNumberManager(QMainWindow):
             cursor.execute('SELECT id FROM mobile_numbers WHERE full_number = ?', (number,))
             if cursor.fetchone():
                 self.show_notification("提示", "该手机号码已存在，无需重复添加！", False)
+                self.landline_input.clear()  # 新增：清空输入框
                 return
             
             # 保存到数据库
@@ -1906,13 +2751,13 @@ class PhoneNumberManager(QMainWindow):
             
             conn.commit()
             self.show_notification("成功", "手机号码添加成功！(使用第三方库)")
-            self.mobile_input.clear()
+            self.landline_input.clear()
             self.load_mobile_data()
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         finally:
             conn.close()
-
 
     
     def delete_landline_number(self):
@@ -1936,8 +2781,9 @@ class PhoneNumberManager(QMainWindow):
             
             # 确认删除
             reply = QMessageBox.question(self, '确认', '确定要删除这条记录吗？', 
-                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                    QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
                 conn = sqlite3.connect('phone_numbers.db')
                 cursor = conn.cursor()
                 try:
@@ -1946,6 +2792,7 @@ class PhoneNumberManager(QMainWindow):
                     self.load_landline_data()
                     self.show_notification("成功", "固话号码删除成功！")
                 except sqlite3.Error as e:
+                    print(f"[DEBUG] 数据库错误: {str(e)}")
                     self.show_notification("错误", f"数据库错误: {str(e)}", False)
                 finally:
                     conn.close()
@@ -1989,11 +2836,11 @@ class PhoneNumberManager(QMainWindow):
             reply = QMessageBox.question(
                 self, '确认', 
                 f'确定要删除ID为 {number_id} 的记录吗？', 
-                QMessageBox.Yes | QMessageBox.No, 
-                QMessageBox.No
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                QMessageBox.StandardButton.No
             )
             
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 conn = None
                 try:
                     conn = sqlite3.connect('phone_numbers.db')
@@ -2016,6 +2863,7 @@ class PhoneNumberManager(QMainWindow):
                 except sqlite3.Error as e:
                     if conn:
                         conn.rollback()
+                    print(f"[DEBUG] 数据库错误: {str(e)}")
                     self.show_notification("错误", f"数据库错误: {str(e)}", False)
                 finally:
                     if conn:
@@ -2024,15 +2872,18 @@ class PhoneNumberManager(QMainWindow):
         except Exception as e:
             self.show_notification("错误", f"删除操作失败: {str(e)}", False)
 
-
-
     
     def load_landline_data(self):
         """加载固话号码数据"""
         conn = sqlite3.connect('phone_numbers.db')
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT id, full_number, area_code, area_location, user_number, registration_time FROM landline_numbers ORDER BY registration_time DESC')
+            cursor.execute('''
+                SELECT id, full_number, area_code, area_location, user_number, registration_time, 
+                       CASE WHEN is_blacklisted THEN '是' ELSE '否' END as blacklist_status
+                FROM landline_numbers 
+                ORDER BY registration_time DESC
+            ''')
             data = cursor.fetchall()
 
             # 临时禁用排序，避免重复触发
@@ -2042,22 +2893,27 @@ class PhoneNumberManager(QMainWindow):
             for row_idx, row_data in enumerate(data):
                 for col_idx, col_data in enumerate(row_data):
                     item = QTableWidgetItem(str(col_data))
-                    item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                    item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
                 
                     # 为数字列设置特殊数据，以便正确排序
                     if col_idx in (0,):  # ID列
-                        item.setData(Qt.DisplayRole, int(col_data) if col_data else item.setData(Qt.DisplayRole, 0))
+                        item.setData(Qt.ItemDataRole.DisplayRole, int(col_data) if col_data else 0)
                     elif col_idx == 5:  # 时间列
-                        item.setData(Qt.DisplayRole, QDateTime.fromString(col_data, "yyyy-MM-dd HH:mm:ss"))
+                        item.setData(Qt.ItemDataRole.DisplayRole, QDateTime.fromString(col_data, "yyyy-MM-dd HH:mm:ss"))
                     else:
-                        item.setData(Qt.DisplayRole, col_data)
+                        item.setData(Qt.ItemDataRole.DisplayRole, col_data)
 
+                    # 黑名单列特殊颜色
+                    if col_idx == 6 and col_data == '是':
+                        item.setBackground(QColor(255, 200, 200))
+                    
                     self.landline_table.setItem(row_idx, col_idx, item)
 
             # 重新启用排序
             self.landline_table.setSortingEnabled(True)
 
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         finally:
             conn.close()
@@ -2075,7 +2931,8 @@ class PhoneNumberManager(QMainWindow):
             
             cursor.execute('''
             SELECT id, full_number, operator_prefix, operator_name, 
-                area_code, area_location, user_number, registration_time 
+                area_code, area_location, user_number, registration_time,
+                CASE WHEN is_blacklisted THEN '是' ELSE '否' END as blacklist_status
             FROM mobile_numbers 
             ORDER BY registration_time DESC
             ''')
@@ -2091,25 +2948,31 @@ class PhoneNumberManager(QMainWindow):
                     display_text = str(col_data) if col_data is not None else ""
                     
                     item = QTableWidgetItem(display_text)
-                    item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                    item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
                     
                     # 为数字列设置特殊数据
                     if col_idx == 0:  # ID列
                         try:
-                            item.setData(Qt.DisplayRole, int(col_data) if col_data else 0)
+                            item.setData(Qt.ItemDataRole.DisplayRole, int(col_data) if col_data else 0)
                         except:
-                            item.setData(Qt.DisplayRole, 0)
+                            item.setData(Qt.ItemDataRole.DisplayRole, 0)
                     elif col_idx == 7:  # 时间列
                         try:
-                            item.setData(Qt.DisplayRole, QDateTime.fromString(col_data, "yyyy-MM-dd HH:mm:ss"))
+                            item.setData(Qt.ItemDataRole.DisplayRole, QDateTime.fromString(col_data, "yyyy-MM-dd HH:mm:ss"))
                         except:
-                            item.setData(Qt.DisplayRole, QDateTime.currentDateTime())
+                            item.setData(Qt.ItemDataRole.DisplayRole, QDateTime.currentDateTime())
+                    
+                    # 黑名单列特殊颜色
+                    if col_idx == 8 and col_data == '是':
+                        item.setBackground(QColor(255, 200, 200))
                     
                     self.mobile_table.setItem(row_idx, col_idx, item)
                     
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         except Exception as e:
+            print(f"[DEBUG] 加载数据错误: {str(e)}")
             self.show_notification("错误", f"加载数据失败: {str(e)}", False)
         finally:
             if conn:
@@ -2128,7 +2991,7 @@ class PhoneNumberManager(QMainWindow):
             special_location = self.is_special_number(keyword)
             if special_location:
                 # 如果是特殊号码，直接返回结果
-                data = [('固话', None, keyword, keyword, special_location, '', '', '', QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"))]
+                data = [('固话', None, keyword, keyword, special_location, '', '', '', QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"), '否')]
                 self.display_query_results(data)
                 return
 
@@ -2140,7 +3003,8 @@ class PhoneNumberManager(QMainWindow):
             if query_type in ["所有号码", "固话号码"]:
                 cursor.execute('''
                 SELECT '固话' as type, id, full_number, area_code, area_location, 
-                    '' as area_code2, '' as area_location2, user_number, registration_time 
+                    '' as area_code2, '' as area_location2, user_number, registration_time,
+                    CASE WHEN is_blacklisted THEN '是' ELSE '否' END as blacklist_status
                 FROM landline_numbers 
                 WHERE full_number LIKE ? OR area_code LIKE ? OR area_location LIKE ? OR user_number LIKE ?
                 ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
@@ -2149,7 +3013,8 @@ class PhoneNumberManager(QMainWindow):
             if query_type in ["所有号码", "手机号码"]:
                 cursor.execute('''
                 SELECT '手机' as type, id, full_number, operator_prefix, operator_name, 
-                    area_code, area_location, user_number, registration_time 
+                    area_code, area_location, user_number, registration_time,
+                    CASE WHEN is_blacklisted THEN '是' ELSE '否' END as blacklist_status
                 FROM mobile_numbers 
                 WHERE full_number LIKE ? OR operator_prefix LIKE ? OR operator_name LIKE ? 
                     OR area_code LIKE ? OR area_location LIKE ? OR user_number LIKE ?
@@ -2174,7 +3039,7 @@ class PhoneNumberManager(QMainWindow):
                     area_code = keyword[3:7]
                     user_number = keyword[7:]
                     data.append(('手机', None, keyword, operator_prefix, operator_name, 
-                                area_code, '未知地区', user_number, QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")))
+                                area_code, '未知地区', user_number, QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"), '否'))
                 else:  # 本地无记录，使用第三方库
                     try:
                         # 使用phonenumbers判断号码类型
@@ -2191,7 +3056,7 @@ class PhoneNumberManager(QMainWindow):
                                 location = phone_pkg_info.get('province', location)
                             
                             data.append(('手机', None, keyword, keyword[:3], operator, 
-                                    keyword[3:7], location, keyword[7:], QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")))
+                                    keyword[3:7], location, keyword[7:], QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"), '否'))
                     except:
                         pass
             
@@ -2210,17 +3075,19 @@ class PhoneNumberManager(QMainWindow):
         for row_idx, row_data in enumerate(data):
             for col_idx, col_data in enumerate(row_data):
                 item = QTableWidgetItem(str(col_data))
-                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
                 
                 if col_idx == 1 and col_data is None:  # ID为空表示实时查询结果
                     item.setText("(实时)")
                 
+                # 黑名单列特殊颜色
+                if col_idx == 9 and col_data == '是':
+                    item.setBackground(QColor(255, 200, 200))
+                
                 self.query_table.setItem(row_idx, col_idx, item)
         
         self.query_table.setSortingEnabled(True)
-        self.query_table.sortByColumn(8, Qt.DescendingOrder)
-
-
+        self.query_table.sortByColumn(8, Qt.SortOrder.DescendingOrder)
 
     
     def get_area_location(self, code):
@@ -2274,9 +3141,6 @@ class PhoneNumberManager(QMainWindow):
         
         # 显示任务栏通知
         self.statusBar().showMessage(message, 5000)  # 显示5秒
-        # 同时显示气泡通知（如果系统支持）
-        if hasattr(self, 'showMessage'):
-            self.showMessage(title, message, icon, 5000)
 
     def parse_phone_number(self, number):
         """使用phonenumbers库解析电话号码"""
@@ -2294,6 +3158,7 @@ class PhoneNumberManager(QMainWindow):
             }
         except Exception as e:
             return {'error': str(e)}
+    
     def parse_phone_iso3166(self, number):
         """使用phone-iso3166库解析电话号码"""
         try:
@@ -2328,11 +3193,7 @@ class PhoneNumberManager(QMainWindow):
             
         except Exception as e:
             print(f"[ERROR] phone库解析失败: {str(e)}")  # 修改为ERROR级别
-            print(f"[WARN] phone库解析失败: {str(e)}")
             return {'error': str(e)}  # 返回错误信息
-            # return None  # 显式返回None便于后续处理
-
-
 
     def show_number_details(self):
         """显示号码的详细解析信息"""
@@ -2408,7 +3269,7 @@ class PhoneNumberManager(QMainWindow):
             msg = QMessageBox()
             msg.setWindowTitle(f"号码详细解析 - {number}")
             msg.setText(details)
-            msg.setIcon(QMessageBox.Information)
+            msg.setIcon(QMessageBox.Icon.Information)
             msg.exec_()
             
         except Exception as e:
@@ -2464,6 +3325,9 @@ class PhoneNumberManager(QMainWindow):
             # 处理固话号码
             self.add_landline_number_auto(number)
 
+        # 无论成功与否，都尝试清空输入框
+        self.landline_input.clear()
+
     def add_landline_number_auto(self, number):
         """添加固话号码（自动调用版本）"""
         # 先检查是否是特殊号码
@@ -2476,6 +3340,7 @@ class PhoneNumberManager(QMainWindow):
                 cursor.execute('SELECT id FROM landline_numbers WHERE full_number = ?', (number,))
                 if cursor.fetchone():
                     self.show_notification("提示", "该号码已存在，无需重复添加！", False)
+                    self.landline_input.clear()  # 确保清空输入框
                     return
                 
                 # 保存特殊号码到数据库
@@ -2489,6 +3354,7 @@ class PhoneNumberManager(QMainWindow):
                 self.load_landline_data()
                 return
             except sqlite3.Error as e:
+                print(f"[DEBUG] 数据库错误: {str(e)}")
                 self.show_notification("错误", f"数据库错误: {str(e)}", False)
                 return
             finally:
@@ -2531,6 +3397,7 @@ class PhoneNumberManager(QMainWindow):
             cursor.execute('SELECT id FROM landline_numbers WHERE full_number = ?', (number,))
             if cursor.fetchone():
                 self.show_notification("提示", "该固话号码已存在，无需重复添加！", False)
+                self.landline_input.clear()  # 确保清空输入框
                 return
         
             # 保存到数据库
@@ -2543,6 +3410,7 @@ class PhoneNumberManager(QMainWindow):
             self.landline_input.clear()
             self.load_landline_data()
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         finally:
             conn.close()
@@ -2574,6 +3442,7 @@ class PhoneNumberManager(QMainWindow):
                 self.load_mobile_data()
                 return
             except sqlite3.Error as e:
+                print(f"[DEBUG] 数据库错误: {str(e)}")
                 self.show_notification("错误", f"数据库错误: {str(e)}", False)
                 return
             finally:
@@ -2613,6 +3482,7 @@ class PhoneNumberManager(QMainWindow):
                 return
                 
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
             conn.close()
             return
@@ -2676,10 +3546,10 @@ class PhoneNumberManager(QMainWindow):
             self.landline_input.clear()
             self.load_mobile_data()
         except sqlite3.Error as e:
+            print(f"[DEBUG] 数据库错误: {str(e)}")
             self.show_notification("错误", f"数据库错误: {str(e)}", False)
         finally:
             conn.close()
-
 
     def is_special_number(self, number):
         """检查是否是特殊号码"""
@@ -2694,10 +3564,529 @@ class PhoneNumberManager(QMainWindow):
             return None
         finally:
             conn.close()
+    
+    def show_import_dialog(self):
+        """显示批量导入对话框"""
+        dialog = ImportDialog(self)
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            self.perform_import(
+                dialog.file_path.text(),
+                dialog.file_type.currentText(),
+                dialog.number_type.currentText(),
+                dialog.skip_duplicates.isChecked()
+            )
+    
+    def perform_import(self, file_path, file_type, number_type, skip_duplicates):
+        """执行批量导入操作"""
+        if not os.path.exists(file_path):
+            self.show_notification("错误", "文件不存在!", False)
+            return
+        
+        try:
+            numbers = []
+            
+            if file_type == "CSV":
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row:  # 跳过空行
+                            numbers.append(row[0].strip())  # 假设号码在第一列
+            else:  # TXT
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:  # 跳过空行
+                            numbers.append(line)
+            
+            if not numbers:
+                self.show_notification("警告", "文件中没有找到有效的号码!", False)
+                return
+            
+            # 开始导入
+            total = len(numbers)
+            success = 0
+            duplicate = 0
+            invalid = 0
+            
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            
+            for number in numbers:
+                try:
+                    # 跳过空号码
+                    if not number:
+                        invalid += 1
+                        continue
+                    
+                    # 确定号码类型
+                    if number_type == "自动检测":
+                        # 11位且以1开头的是手机号码
+                        if len(number) == 11 and number.startswith('1'):
+                            current_type = "手机"
+                        else:
+                            current_type = "固话"
+                    else:
+                        current_type = number_type
+                    
+                    # 检查是否已存在
+                    if skip_duplicates:
+                        if current_type == "手机":
+                            cursor.execute('SELECT id FROM mobile_numbers WHERE full_number = ?', (number,))
+                        else:
+                            cursor.execute('SELECT id FROM landline_numbers WHERE full_number = ?', (number,))
+                        
+                        if cursor.fetchone():
+                            duplicate += 1
+                            continue
+                    
+                    # 添加到数据库
+                    if current_type == "手机":
+                        self.add_mobile_number_auto(number)
+                    else:
+                        self.add_landline_number_auto(number)
+                    
+                    success += 1
+                    
+                except Exception as e:
+                    print(f"导入号码 {number} 时出错: {str(e)}")
+                    invalid += 1
+            
+            conn.commit()
+            conn.close()
+            
+            # 显示导入结果
+            result_msg = (
+                f"导入完成!\n\n"
+                f"总数: {total}\n"
+                f"成功: {success}\n"
+                f"重复跳过: {duplicate}\n"
+                f"无效: {invalid}"
+            )
+            QMessageBox.information(self, "导入结果", result_msg)
+            
+            # 刷新数据
+            self.load_landline_data()
+            self.load_mobile_data()
+            
+        except Exception as e:
+            self.show_notification("错误", f"导入失败: {str(e)}", False)
+    
+    def export_data(self):
+        """导出数据到文件"""
+        # 获取当前活动标签页
+        current_tab = self.tabs.currentIndex()
+        
+        # 根据当前标签页确定导出内容
+        if current_tab == 0:  # 固话
+            table = "landline_numbers"
+            default_name = "固话号码"
+        elif current_tab == 1:  # 手机
+            table = "mobile_numbers"
+            default_name = "手机号码"
+        else:  # 查询结果
+            # 导出查询结果
+            self.export_query_results()
+            return
+        
+        # 选择保存位置
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getSaveFileName(
+            self, "导出数据", 
+            f"{default_name}_{datetime.now().strftime('%Y%m%d')}.csv",
+            "CSV文件 (*.csv);;文本文件 (*.txt)"
+        )
+        
+        if not file_path:
+            return  # 用户取消
+        
+        try:
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            
+            # 获取数据
+            if table == "landline_numbers":
+                cursor.execute('''
+                    SELECT full_number, area_code, area_location, user_number, registration_time
+                    FROM landline_numbers
+                    ORDER BY registration_time DESC
+                ''')
+                headers = ["完整号码", "区号", "归属地", "用户号码", "登记时间"]
+            else:
+                cursor.execute('''
+                    SELECT full_number, operator_prefix, operator_name, area_code, area_location, user_number, registration_time
+                    FROM mobile_numbers
+                    ORDER BY registration_time DESC
+                ''')
+                headers = ["完整号码", "运营商前缀", "运营商", "地区编码", "归属地", "用户号码", "登记时间"]
+            
+            data = cursor.fetchall()
+            
+            # 写入文件
+            with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                
+                # 写入表头
+                writer.writerow(headers)
+                
+                # 写入数据
+                writer.writerows(data)
+            
+            self.show_notification("成功", f"数据已成功导出到 {file_path}")
+            
+        except Exception as e:
+            self.show_notification("错误", f"导出失败: {str(e)}", False)
+        finally:
+            if 'conn' in locals():
+                conn.close()
+    
+    def export_query_results(self):
+        """导出查询结果"""
+        if self.query_table.rowCount() == 0:
+            self.show_notification("警告", "没有查询结果可导出!", False)
+            return
+        
+        # 选择保存位置
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getSaveFileName(
+            self, "导出查询结果", 
+            f"号码查询结果_{datetime.now().strftime('%Y%m%d')}.csv",
+            "CSV文件 (*.csv);;文本文件 (*.txt)"
+        )
+        
+        if not file_path:
+            return  # 用户取消
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                
+                # 写入表头
+                headers = []
+                for col in range(self.query_table.columnCount()):
+                    headers.append(self.query_table.horizontalHeaderItem(col).text())
+                writer.writerow(headers)
+                
+                # 写入数据
+                for row in range(self.query_table.rowCount()):
+                    row_data = []
+                    for col in range(self.query_table.columnCount()):
+                        item = self.query_table.item(row, col)
+                        row_data.append(item.text() if item else "")
+                    writer.writerow(row_data)
+            
+            self.show_notification("成功", f"查询结果已成功导出到 {file_path}")
+            
+        except Exception as e:
+            self.show_notification("错误", f"导出失败: {str(e)}", False)
+    
+    def show_stats_dialog(self):
+        """显示统计图表对话框"""
+        dialog = StatsDialog(self)
+        dialog.exec_()
+    
+    def show_blacklist_dialog(self):
+        """显示黑名单管理对话框"""
+        dialog = BlacklistDialog(self)
+        dialog.exec_()
+    
+    def show_backup_dialog(self):
+        """显示备份/恢复对话框"""
+        dialog = BackupDialog(self)
+        dialog.exec_()
+    
+    def show_location_map(self):
+        """显示归属地地图"""
+        try:
+            # 从数据库获取所有归属地信息
+            conn = sqlite3.connect('phone_numbers.db')
+            cursor = conn.cursor()
+            
+            # 获取手机号码归属地
+            cursor.execute('''
+                SELECT area_location, COUNT(*) as count 
+                FROM mobile_numbers 
+                WHERE area_location NOT IN ('无', '未知地区')
+                GROUP BY area_location
+                ORDER BY count DESC
+            ''')
+            mobile_locations = cursor.fetchall()
+            
+            # 获取固话号码归属地
+            cursor.execute('''
+                SELECT area_location, COUNT(*) as count 
+                FROM landline_numbers 
+                WHERE area_location NOT IN ('无', '未知地区')
+                GROUP BY area_location
+                ORDER BY count DESC
+            ''')
+            landline_locations = cursor.fetchall()
+            
+            conn.close()
+            
+            # 如果没有数据，显示提示
+            if not mobile_locations and not landline_locations:
+                self.show_notification("提示", "没有足够的归属地数据来生成地图!", False)
+                return
+            
+            # 创建地图 - 以中国为中心
+            m = folium.Map(location=[35, 105], zoom_start=5,
+                        tiles='https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}',
+                        attr='高德地图')
+            
+            # 创建坐标缓存
+            coord_cache = {}
+            
+            # 创建手机号码标记集群
+            mobile_cluster = folium.plugins.MarkerCluster(name="手机号码分布").add_to(m)
+            
+            # 添加手机号码分布标记
+            for location, count in mobile_locations:
+                if location not in coord_cache:
+                    lat, lng = self.get_location_coordinates(location)
+                    if lat and lng:
+                        coord_cache[location] = (lat, lng)
+                
+                if location in coord_cache:
+                    lat, lng = coord_cache[location]
+                    # 根据数量大小调整标记大小
+                    radius = min(10 + count / 10, 30)
+                    
+                    folium.CircleMarker(
+                        location=[lat, lng],
+                        radius=radius,
+                        popup=f"手机号码: {location}<br>数量: {count}",
+                        color='blue',
+                        fill=True,
+                        fill_color='blue'
+                    ).add_to(mobile_cluster)
+            
+            # 创建固话号码标记集群
+            landline_cluster = folium.plugins.MarkerCluster(name="固话号码分布").add_to(m)
+            
+            # 添加固话号码分布标记
+            for location, count in landline_locations:
+                if location not in coord_cache:
+                    lat, lng = self.get_location_coordinates(location)
+                    if lat and lng:
+                        coord_cache[location] = (lat, lng)
+                
+                if location in coord_cache:
+                    lat, lng = coord_cache[location]
+                    # 根据数量大小调整标记大小
+                    radius = min(10 + count / 10, 30)
+                    
+                    folium.CircleMarker(
+                        location=[lat, lng],
+                        radius=radius,
+                        popup=f"固话号码: {location}<br>数量: {count}",
+                        color='red',
+                        fill=True,
+                        fill_color='red'
+                    ).add_to(landline_cluster)
+            
+            # 添加图层控制
+            folium.LayerControl().add_to(m)
+            
+            # 添加全屏按钮
+            folium.plugins.Fullscreen().add_to(m)
+            
+            # 保存为临时HTML文件并打开
+            temp_file = tempfile.NamedTemporaryFile(prefix='phone_map_', suffix='.html', delete=False)
+            m.save(temp_file.name)
+            webbrowser.open(f'file://{temp_file.name}')
+            
+        except Exception as e:
+            print(f"[ERROR] 生成地图失败: {str(e)}")
+            self.show_notification("错误", f"生成地图失败: {str(e)}", False)
+
+    
+    def get_location_coordinates(self, location):
+        """
+        获取地点坐标，优先使用本地缓存，其次尝试在线API查询
+        返回: (纬度, 经度) 或 (None, None)
+        """
+        # 1. 检查本地缓存文件
+        cache_file = "location_coordinates.json"
+        cache = {}
+        
+        try:
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                    
+            # 检查缓存中是否已有该地点
+            if location in cache:
+                return cache[location]['lat'], cache[location]['lng']
+        except:
+            pass
+        
+        # 2. 本地硬编码的主要城市坐标（作为备用）
+        major_cities = {
+            '北京': (39.9042, 116.4074),
+            '上海': (31.2304, 121.4737),
+            '广州': (23.1291, 113.2644),
+            '深圳': (22.5431, 114.0579),
+            '杭州': (30.2741, 120.1551),
+            '南京': (32.0603, 118.7969),
+            '武汉': (30.5928, 114.3052),
+            '成都': (30.5728, 104.0668),
+            '重庆': (29.4316, 106.9123),
+            '西安': (34.3416, 108.9398),
+            # 添加更多省会城市
+            '天津': (39.0842, 117.2010),
+            '石家庄': (38.0422, 114.5086),
+            '太原': (37.8700, 112.5500),
+            '呼和浩特': (40.8426, 111.7490),
+            '沈阳': (41.8036, 123.4150),
+            '长春': (43.8171, 125.3235),
+            '哈尔滨': (45.8038, 126.5350),
+            '合肥': (31.8206, 117.2272),
+            '福州': (26.0745, 119.2965),
+            '南昌': (28.6820, 115.8579),
+            '济南': (36.6512, 117.1200),
+            '郑州': (34.7473, 113.6249),
+            '长沙': (28.2282, 112.9388),
+            '南宁': (22.8176, 108.3660),
+            '海口': (20.0440, 110.1999),
+            '贵阳': (26.6470, 106.6302),
+            '昆明': (24.8801, 102.8329),
+            '拉萨': (29.6441, 91.1145),
+            '兰州': (36.0611, 103.8343),
+            '西宁': (36.6232, 101.7787),
+            '银川': (38.4872, 106.2309),
+            '乌鲁木齐': (43.8256, 87.6168),
+            '香港': (22.3193, 114.1694),
+            '澳门': (22.1987, 113.5439),
+            '台北': (25.0330, 121.5654)
+        }
+        
+        # 检查是否是主要城市
+        for city, coords in major_cities.items():
+            if city in location:
+                return coords
+        
+        # 3. 尝试使用在线API查询（使用配置中的API Key）
+        try:
+            api_key = self.config.get('gaode_api_key')
+            if not api_key:
+                print("[WARNING] 未配置高德地图API Key")
+                return None, None
+                
+            url = f"https://restapi.amap.com/v3/geocode/geo?address={location}&key={api_key}"
+            response = requests.get(url, timeout=5)
+            data = response.json()
+            
+            if data['status'] == '1' and data['count'] != '0':
+                # 解析经纬度
+                lng, lat = data['geocodes'][0]['location'].split(',')
+                coords = (float(lat), float(lng))
+                
+                # 更新缓存
+                cache[location] = {'lat': coords[0], 'lng': coords[1]}
+                try:
+                    with open(cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(cache, f, ensure_ascii=False, indent=2)
+                except:
+                    pass
+                    
+                return coords
+        except Exception as api_error:
+            print(f"API查询失败: {str(api_error)}")
+        
+        # 4. 尝试从地点字符串中提取城市名再次查询
+        if '省' in location or '市' in location:
+            # 尝试提取市级名称
+            city = location.split('市')[0] + '市' if '市' in location else location
+            if city in major_cities:
+                return major_cities[city]
+            
+            # 尝试提取省级名称
+            province = location.split('省')[0] + '省' if '省' in location else None
+            if province and province in major_cities:
+                return major_cities[province]
+        
+        # 5. 所有方法都失败，返回None
+        return None, None
+
+    
+    def show_about_dialog(self):
+        """显示关于对话框"""
+        about_text = (
+            f"<h2>{ProjectInfo.NAME}</h2>"
+            f"<p>版本: {ProjectInfo.VERSION}</p>"
+            f"<p>构建日期: {ProjectInfo.BUILD_DATE}</p>"
+            f"<p>作者: {ProjectInfo.AUTHOR}</p>"
+            f"<p>许可证: {ProjectInfo.LICENSE}</p>"
+            f"<p>版权所有: {ProjectInfo.COPYRIGHT}</p>"
+            f"<p>项目主页: <a href='{ProjectInfo.URL}'>{ProjectInfo.URL}</a></p>"
+            f"<p>{ProjectInfo.DESCRIPTION}</p>"
+        )
+        
+        msg = QMessageBox()
+        msg.setWindowTitle("关于")
+        msg.setText(about_text)
+        msg.setIconPixmap(QPixmap('icon.ico').scaled(64, 64))
+        msg.exec_()
+    
+    def close_db_connections(self):
+        """关闭所有数据库连接（用于备份恢复前）"""
+        try:
+            # 检查并关闭所有可能打开的数据库连接
+            if hasattr(self, 'conn') and self.conn:
+                try:
+                    self.conn.close()
+                except Exception as e:
+                    print(f"关闭主连接时出错: {str(e)}")
+                finally:
+                    self.conn = None
+            
+            # 关闭可能在查询中打开的临时连接
+            for attr in dir(self):
+                if attr.startswith('_db_conn_'):
+                    conn = getattr(self, attr)
+                    if conn:
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                        finally:
+                            setattr(self, attr, None)
+            
+            # 确保SQLite文件没有被锁定
+            if os.path.exists('phone_numbers.db'):
+                try:
+                    # 尝试打开文件以确认是否可访问
+                    with open('phone_numbers.db', 'rb'):
+                        pass
+                except IOError as e:
+                    print(f"数据库文件仍被锁定: {str(e)}")
+                    # 如果是Windows系统，尝试强制关闭
+                    if sys.platform == 'win32':
+                        try:
+                            os.system('taskkill /f /im sqlite3.exe')
+                        except:
+                            pass
+            
+            # 额外等待确保连接完全关闭
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"关闭数据库连接时发生错误: {str(e)}")
+            raise RuntimeError("无法安全关闭数据库连接") from e
+
+    
+    def refresh_all_data(self):
+        """刷新所有数据"""
+        self.load_landline_data()
+        self.load_mobile_data()
+        self.query_numbers()
 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = PhoneNumberManager()
-    window.show()
-    sys.exit(app.exec_())
+    if window._start_maximized:
+        window.showMaximized()
+    else:
+        window.show()
+    sys.exit(app.exec())
